@@ -1,9 +1,9 @@
 import React, { useState, useEffect } from 'react';
 import { useAuth } from '../../contexts/AuthContext';
 import { Link } from 'react-router-dom';
-import { BookOpen, Users, Calendar, Clock, Bell, Plus, Star, Award } from 'lucide-react';
+import { BookOpen, Users, Clock, Bell, Plus, Award, MessageCircle, X } from 'lucide-react';
 import { db } from '../../config/firebase';
-import { collection, query, where, onSnapshot, doc, updateDoc, getDoc, orderBy } from 'firebase/firestore';
+import { collection, query, where, onSnapshot, doc, updateDoc, getDoc } from 'firebase/firestore';
 import { toast } from 'react-hot-toast';
 
 interface Stats {
@@ -11,14 +11,6 @@ interface Stats {
   studyGroups: number;
   upcomingClasses: number;
   totalCredits: number;
-  timetableStatus?: string;
-}
-
-interface RecentActivity {
-  id: string;
-  title: string;
-  time: any;
-  icon?: any;
 }
 
 interface StudyGroup {
@@ -44,22 +36,32 @@ interface TimetableEntry {
 
 const Dashboard: React.FC = () => {
   const { currentUser } = useAuth();
-  const [stats, setStats] = useState<Stats>({ enrolledCourses: 0, studyGroups: 0, upcomingClasses: 0, totalCredits: 0 });
-  const [recentActivity, setRecentActivity] = useState<RecentActivity[]>([]);
+  const [stats, setStats] = useState<Stats>({
+    enrolledCourses: 0,
+    studyGroups: 0,
+    upcomingClasses: 0,
+    totalCredits: 0
+  });
   const [todayClasses, setTodayClasses] = useState<TimetableEntry[]>([]);
   const [studyGroups, setStudyGroups] = useState<StudyGroup[]>([]);
+
+  // --- Chatbot State ---
+  const [chatOpen, setChatOpen] = useState(false);
+  const [messages, setMessages] = useState<{ sender: string; text: string }[]>([]);
+  const [input, setInput] = useState('');
+  const [loading, setLoading] = useState(false);
 
   // --- Helper for online status ---
   const isOnline = (lastSeen: any) => {
     if (!lastSeen) return false;
     const diff = Date.now() - lastSeen.toMillis();
-    return diff < 2 * 60 * 1000; // last 2 minutes
+    return diff < 2 * 60 * 1000;
   };
 
   useEffect(() => {
     if (!currentUser) return;
 
-    // --- Enrollments & total credits ---
+    // Enrollments
     const enrollQ = query(collection(db, 'enrollments'), where('uid', '==', currentUser.uid));
     const unsubscribeEnroll = onSnapshot(enrollQ, async snapshot => {
       const enrollments = snapshot.docs.map(doc => doc.data());
@@ -68,12 +70,14 @@ const Dashboard: React.FC = () => {
         try {
           const courseSnap = await getDoc(doc(db, 'courses', e.courseId));
           totalCredits += courseSnap.exists() ? courseSnap.data().credits || 3 : 3;
-        } catch { totalCredits += 3; }
+        } catch {
+          totalCredits += 3;
+        }
       }
       setStats(prev => ({ ...prev, enrolledCourses: enrollments.length, totalCredits }));
     });
 
-    // --- Study Groups ---
+    // Study Groups
     const groupsQ = collection(db, 'studyGroups');
     const unsubscribeGroups = onSnapshot(groupsQ, snapshot => {
       const groupsData: StudyGroup[] = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as StudyGroup));
@@ -84,40 +88,25 @@ const Dashboard: React.FC = () => {
       }));
     });
 
-    // --- Today's Classes ---
+    // Today’s Classes
     const timetableQ = query(collection(db, 'timetables'), where('uid', '==', currentUser.uid));
     const unsubscribeTimetable = onSnapshot(timetableQ, snapshot => {
       const allClasses = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
       const today = new Date().toLocaleDateString('en-US', { weekday: 'long' });
       const filtered = allClasses.filter(c => c.day === today)
-                                .sort((a, b) => a.startTime.localeCompare(b.startTime));
+        .sort((a, b) => a.startTime.localeCompare(b.startTime));
       setTodayClasses(filtered);
       setStats(prev => ({ ...prev, upcomingClasses: filtered.length }));
     });
-
-    // --- Recent Activity ---
-    const activityQ = query(collection(db, `users/${currentUser.uid}/recentActivity`), orderBy('time', 'desc'));
-    const unsubscribeActivity = onSnapshot(activityQ, snapshot => {
-      const acts = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-      setRecentActivity(acts);
-    });
-
-    // --- Update user last seen for online status ---
-    const userRef = doc(db, 'users', currentUser.uid);
-    const interval = setInterval(() => {
-      updateDoc(userRef, { lastSeen: new Date() }).catch(console.error);
-    }, 60 * 1000); // every 1 minute
 
     return () => {
       unsubscribeEnroll();
       unsubscribeGroups();
       unsubscribeTimetable();
-      unsubscribeActivity();
-      clearInterval(interval);
     };
   }, [currentUser]);
 
-  // --- Join / Leave Study Group ---
+  // --- Join / Leave Group ---
   const handleJoinLeaveGroup = async (group: StudyGroup) => {
     if (!currentUser) return toast.error('Sign in to continue');
     const groupRef = doc(db, 'studyGroups', group.id);
@@ -128,7 +117,14 @@ const Dashboard: React.FC = () => {
         toast.success(`Left ${group.name}`);
       } else {
         if (group.members.length >= group.maxMembers) return toast.error('Group is full');
-        const newMember = { userId: currentUser.uid, name: currentUser.displayName || 'Anonymous', role: 'member', joinedAt: new Date(), status: 'active', lastSeen: new Date() };
+        const newMember = {
+          userId: currentUser.uid,
+          name: currentUser.displayName || 'Anonymous',
+          role: 'member',
+          joinedAt: new Date(),
+          status: 'active',
+          lastSeen: new Date()
+        };
         await updateDoc(groupRef, { members: [...group.members, newMember] });
         toast.success(`Joined ${group.name}`);
       }
@@ -136,6 +132,52 @@ const Dashboard: React.FC = () => {
       console.error(err);
       toast.error('Failed to update group');
     }
+  };
+
+  // --- Chatbot Logic with academic context ---
+  const sendMessage = async () => {
+    if (!input.trim()) return;
+    const userMsg = { sender: 'user', text: input };
+    setMessages(prev => [...prev, userMsg]);
+    setInput('');
+    setLoading(true);
+
+    try {
+      // Build context
+      const contextPrompt = `
+You are StudyNet AI Assistant.
+User: ${currentUser?.displayName || "Student"}.
+Enrolled Courses: ${stats.enrolledCourses}.
+Study Groups: ${stats.studyGroups}.
+Upcoming Classes Today: ${todayClasses.map(c => `${c.course} at ${c.startTime}`).join(", ") || "None"}.
+Total Credits: ${stats.totalCredits}.
+
+If the question is academic, answer using this context. 
+If not, answer as a general helpful assistant.
+
+Question: ${input}
+      `;
+
+      const res = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${import.meta.env.VITE_GEMINI_API_KEY}`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            contents: [{ parts: [{ text: contextPrompt }] }]
+          })
+        }
+      );
+
+      const data = await res.json();
+      const botText = data?.candidates?.[0]?.content?.parts?.[0]?.text || "Sorry, I couldn’t process that.";
+      setMessages(prev => [...prev, { sender: 'bot', text: botText }]);
+    } catch (err) {
+      console.error(err);
+      setMessages(prev => [...prev, { sender: 'bot', text: "Error: Unable to reach Gemini AI." }]);
+    }
+
+    setLoading(false);
   };
 
   const StatCard: React.FC<{ title: string; value: number | string; icon: any; color: string }> = ({ title, value, icon: Icon, color }) => (
@@ -153,7 +195,7 @@ const Dashboard: React.FC = () => {
   );
 
   return (
-    <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
+    <div className="relative max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
       {/* Welcome */}
       <div className="mb-8">
         <div className="flex flex-col md:flex-row items-start md:items-center justify-between mb-4 gap-4">
@@ -184,25 +226,12 @@ const Dashboard: React.FC = () => {
       <div className="mb-8">
         <h2 className="text-xl font-semibold text-gray-900 mb-4">Today's Classes</h2>
         {todayClasses.length === 0 ? <p className="text-gray-500">No classes today.</p> :
-          todayClasses.map(cls => {
-            const now = new Date();
-            const [startHour, startMin] = cls.startTime.split(':').map(Number);
-            const [endHour, endMin] = cls.endTime.split(':').map(Number);
-            const startTime = new Date(now); startTime.setHours(startHour, startMin, 0);
-            const endTime = new Date(now); endTime.setHours(endHour, endMin, 0);
-
-            let bgClass = 'bg-white';
-            if (now >= startTime && now <= endTime) bgClass = 'bg-green-100 border-green-500 border-l-4';
-            else if (now < startTime) bgClass = 'bg-yellow-50 border-yellow-400 border-l-4';
-            else bgClass = 'bg-gray-50 border-gray-300 border-l-4';
-
-            return (
-              <div key={cls.id} className={`p-4 mb-2 rounded-md shadow-sm transition ${bgClass}`}>
-                <p className="font-semibold text-gray-900">{cls.course}</p>
-                <p className="text-sm text-gray-600">{cls.time} • {cls.location} • {cls.instructor}</p>
-              </div>
-            )
-          })
+          todayClasses.map(cls => (
+            <div key={cls.id} className="p-4 mb-2 rounded-md shadow-sm bg-white border-l-4 border-gray-300">
+              <p className="font-semibold text-gray-900">{cls.course}</p>
+              <p className="text-sm text-gray-600">{cls.startTime} - {cls.endTime} • {cls.location} • {cls.instructor}</p>
+            </div>
+          ))
         }
       </div>
 
@@ -244,7 +273,51 @@ const Dashboard: React.FC = () => {
         </div>
       </div>
 
-  
+      {/* Floating Chatbot Button */}
+      <button
+        onClick={() => setChatOpen(!chatOpen)}
+        className="fixed bottom-6 right-6 bg-blue-600 text-white p-4 rounded-full shadow-lg hover:bg-blue-700 transition"
+      >
+        {chatOpen ? <X className="w-6 h-6" /> : <MessageCircle className="w-6 h-6" />}
+      </button>
+
+      {/* Chat Window */}
+      {chatOpen && (
+        <div className="fixed bottom-20 right-6 w-80 bg-white shadow-xl rounded-xl border border-gray-200 flex flex-col">
+          <div className="p-3 border-b font-semibold text-gray-800">AI Assistant 🤖</div>
+          <div className="flex-1 overflow-y-auto p-3 space-y-2 max-h-96">
+            {messages.map((msg, idx) => (
+              <div
+                key={idx}
+                className={`p-2 rounded-lg text-sm max-w-[80%] ${
+                  msg.sender === 'user'
+                    ? 'ml-auto bg-blue-600 text-white'
+                    : 'mr-auto bg-gray-200 text-gray-800'
+                }`}
+              >
+                {msg.text}
+              </div>
+            ))}
+            {loading && <p className="text-xs text-gray-500">Thinking...</p>}
+          </div>
+          <div className="p-2 border-t flex items-center gap-2">
+            <input
+              value={input}
+              onChange={e => setInput(e.target.value)}
+              onKeyDown={e => e.key === 'Enter' && sendMessage()}
+              placeholder="Ask me anything..."
+              className="flex-1 px-3 py-2 border rounded-lg text-sm focus:outline-none"
+            />
+            <button
+              onClick={sendMessage}
+              disabled={loading}
+              className="bg-blue-600 text-white px-3 py-2 rounded-lg hover:bg-blue-700 disabled:opacity-50"
+            >
+              Send
+            </button>
+          </div>
+        </div>
+      )}
     </div>
   );
 };
